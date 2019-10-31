@@ -1,8 +1,7 @@
+using Azure.Messaging.EventHubs;
 using McMaster.Extensions.CommandLineUtils;
-using Microsoft.Azure.EventHubs;
 using System;
 using System.ComponentModel.DataAnnotations;
-using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,54 +9,40 @@ using System.Threading.Tasks;
 namespace watch_event_hubs
 {
     [Command(Description = "Dump messages from event hubs")]
-    class Program
+    internal class Program
     {
         public static int Main(string[] args) => CommandLineApplication.Execute<Program>(args);
 
         [Argument(0, Description = "The connection string for the event hub")]
         [Required]
-        public string ConnectionString { get; }
+        public string ConnectionString { get; } = default!;
 
         [Option(CommandOptionType.NoValue, Description = "Get events from the start")]
         public bool FromStart { get; }
 
         public string ConsumerGroup { get; } = "$default";
 
-        private async Task<int> OnExecute()
+        public async Task<int> OnExecute()
         {
-            using (var cts = new CancellationTokenSource())
+            using var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (o, e) =>
             {
-                Console.CancelKeyPress += (o, e) =>
-                {
-                    Console.WriteLine("Shutting down...");
-                    cts.Cancel();
-                };
-                var ct = cts.Token;
+                Console.WriteLine("Shutting down...");
+                cts.Cancel();
+            };
+            var ct = cts.Token;
 
-                var tcs = new TaskCompletionSource<bool>();
-                var client = EventHubClient.CreateFromConnectionString(ConnectionString);
-                using (ct.Register(() => tcs.SetResult(true)))
-                {
-                    var info = await client.GetRuntimeInformationAsync();
-                    Console.WriteLine($"Got {info.PartitionCount} partitions");
-                    var tasks = new Task[info.PartitionCount + 1];
-                    for (var i = 0; i < info.PartitionCount; i++)
-                    {
-                        tasks[i] = RunForPartition(info.PartitionIds[i], client, ct);
-                    }
-                    tasks[tasks.Length - 1] = ClosingTask(client, tcs.Task);
-                    await Task.WhenAll(tasks);
-                }
-                return 0;
+            var tcs = new TaskCompletionSource<bool>();
+            await using var client = new EventHubClient(ConnectionString);
+            var partitions = await client.GetPartitionIdsAsync(ct);
+            Console.WriteLine($"Got {partitions.Length} partitions");
+            var tasks = new Task[partitions.Length];
+            for (var i = 0; i < partitions.Length; i++)
+            {
+                tasks[i] = RunForPartition(partitions[i], client, ct);
             }
-        }
-
-        private async Task ClosingTask(EventHubClient client, Task taskToWaitBeforeClosing)
-        {
-            await taskToWaitBeforeClosing;
-            Console.WriteLine("Closing");
-            await client.CloseAsync();
-            Console.WriteLine("Closed");
+            await Task.WhenAll(tasks);
+            return 0;
         }
 
         private async Task RunForPartition(string partitionId, EventHubClient client, CancellationToken ct)
@@ -65,15 +50,11 @@ namespace watch_event_hubs
             Console.WriteLine($"Running for partition {partitionId} {(FromStart ? "from start" : "")}");
             try
             {
-                var receiver = client.CreateReceiver(ConsumerGroup, partitionId, FromStart ? EventPosition.FromStart() : EventPosition.FromEnd());
-                while (!ct.IsCancellationRequested)
+                await using var consumer = client.CreateConsumer(ConsumerGroup, partitionId, FromStart ? EventPosition.Earliest : EventPosition.Latest);
+                await foreach (var message in consumer.SubscribeToEvents(ct))
                 {
-                    var messages = await receiver.ReceiveAsync(100);
-                    foreach (var message in messages ?? Enumerable.Empty<EventData>())
-                    {
-                        var json = Encoding.UTF8.GetString(message.Body);
-                        Console.WriteLine($"{message.SystemProperties.EnqueuedTimeUtc}: {message.SystemProperties.Offset} ({message.SystemProperties.SequenceNumber})\n{json}");
-                    }
+                    var json = Encoding.UTF8.GetString(message.Body.Span);
+                    Console.WriteLine($"{message.EnqueuedTime}: {message.Offset} ({message.SequenceNumber})\n{json}");
                 }
             }
             catch (Exception ex)
